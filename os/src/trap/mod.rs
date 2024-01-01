@@ -1,13 +1,30 @@
-use core::arch::global_asm;
-
 mod context;
-//
-use crate::task::{exit_current_and_run_next, suspend_current_and_run_next};
-
-
-global_asm!(include_str!("trap.S"));
 
 use core::arch::asm;
+use core::arch::global_asm;
+use riscv::register::{
+    mtvec::TrapMode,
+    stvec,
+    scause::{
+        self,
+        Trap,
+        Exception,
+        Interrupt,
+    },
+    stval,
+    sie,
+};
+use crate::syscall::syscall;
+use crate::task::{
+    exit_current_and_run_next,
+    suspend_current_and_run_next,
+    current_user_token,
+    current_trap_cx,
+};
+use crate::timer::set_next_trigger;
+use crate::config::{TRAP_CONTEXT, TRAMPOLINE};
+
+global_asm!(include_str!("trap.S"));
 
 pub fn init() {
     set_kernel_trap_entry();
@@ -25,55 +42,45 @@ fn set_user_trap_entry() {
     }
 }
 
-use riscv::register::{
-    mtvec::TrapMode,
-    stvec,
-    scause::{
-        self,
-        Trap,
-        Exception,
-        Interrupt
-    },
-    stval,
-    sie
-};
-
-use crate::syscall::syscall;
-
-use crate::task::{
-    current_user_token,
-    current_trap_cx,
-};
-
-use crate::config::{TRAP_CONTEXT, TRAMPOLINE};
-
-use crate::timer::set_next_trigger;
-
 pub fn enable_timer_interrupt() {
     unsafe { sie::set_stimer(); }
 }
 
-pub use context::TrapContext;
-
 #[no_mangle]
 pub fn trap_handler() -> ! {
     set_kernel_trap_entry();
-    let cx = current_trap_cx();
     let scause = scause::read();
     let stval = stval::read();
     match scause.cause() {
         Trap::Exception(Exception::UserEnvCall) => {
+            // jump to next instruction anyway
+            let mut cx = current_trap_cx();
             cx.sepc += 4;
-            cx.x[10] = syscall(cx.x[17], [cx.x[10], cx.x[11], cx.x[12]]) as usize;
+            // get system call return value
+            let result = syscall(cx.x[17], [cx.x[10], cx.x[11], cx.x[12]]);
+            // cx is changed during sys_exec, so we have to call it again
+            cx = current_trap_cx();
+            cx.x[10] = result as usize;
         }
         Trap::Exception(Exception::StoreFault) |
-        Trap::Exception(Exception::StorePageFault) => {
-            println!("[kernel] PageFault in application, bad addr = {:#x}, bad instruction = {:#x}, core dumped.", stval, cx.sepc);
-            exit_current_and_run_next();
+        Trap::Exception(Exception::StorePageFault) |
+        Trap::Exception(Exception::InstructionFault) |
+        Trap::Exception(Exception::InstructionPageFault) |
+        Trap::Exception(Exception::LoadFault) |
+        Trap::Exception(Exception::LoadPageFault) => {
+            println!(
+                "[kernel] {:?} in application, bad addr = {:#x}, bad instruction = {:#x}, core dumped.",
+                scause.cause(),
+                stval,
+                current_trap_cx().sepc,
+            );
+            // page fault exit code
+            exit_current_and_run_next(-2);
         }
         Trap::Exception(Exception::IllegalInstruction) => {
             println!("[kernel] IllegalInstruction in application, core dumped.");
-            exit_current_and_run_next();
+            // illegal instruction exit code
+            exit_current_and_run_next(-3);
         }
         Trap::Interrupt(Interrupt::SupervisorTimer) => {
             set_next_trigger();
@@ -110,5 +117,7 @@ pub fn trap_return() -> ! {
 
 #[no_mangle]
 pub fn trap_from_kernel() -> ! {
-    panic!("a trap from kernel!");
+    panic!("a trap {:?} from kernel!", scause::read().cause());
 }
+
+pub use context::{TrapContext};
